@@ -1,0 +1,9 @@
+## Interface: 120001, 120000
+## Title: Jar's Bags
+## Notes: All-in-one bag replacement with categories, quality indicators, and equipment set highlighting
+## Author: Jar
+## Version: 1.0
+## SavedVariables: JarsBagsDB
+
+BestGearCore.lua
+JarsBags.lua
