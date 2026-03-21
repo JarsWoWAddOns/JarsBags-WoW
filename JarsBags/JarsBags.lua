@@ -85,6 +85,7 @@ for _, bagID in ipairs(BAG_IDS) do
     bagParentFrames[bagID] = f
 end
 
+
 ---------------------------------------------------------------------------
 -- Saved Variables
 ---------------------------------------------------------------------------
@@ -1167,6 +1168,8 @@ local function HookDefaultBags()
     hooksecurefunc("CloseAllBags", function()
         frame:Hide()
     end)
+
+
 end
 
 ---------------------------------------------------------------------------
