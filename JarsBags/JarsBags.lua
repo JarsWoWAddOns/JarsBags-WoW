@@ -65,13 +65,21 @@ local DEFAULTS = {
     lockMovement       = false,
 }
 local mainFrame = nil
-local itemButtons = {}        -- pool of item button frames
+-- local itemButtons = {}        -- pool of item button frames
+local slotButtons = {}        -- [bagID][slotID] = button, made once out of combat
 local activeButtons = {}      -- currently visible buttons
 local categoryHeaders = {}    -- pool of header frames
 local activeHeaders = {}      -- currently visible headers
-local equipSetLookup = {}     -- ["bagID-slotID"] = true
+local slotData = {}           -- [bagID][slotID] = item entry or false
+local dirtyBags = {}          -- bags that need a rescan
+local trackCache = {}         -- [hyperlink] = { letter, color } or false
+local newItemCache = {}       -- ["bagID-slotID"] = true, rebuilt each RefreshBags
+local needsCombatRefresh = false
+local bestGearDirty = true
 local pendingRefresh = false
 local refreshTimer = nil
+
+for _, bagID in ipairs(BAG_IDS) do dirtyBags[bagID] = true end
 
 -- One parent frame per bag ID. ContainerFrameItemButtonTemplate uses GetParent():GetID()
 -- to determine the bag for click actions. Buttons are reparented here in LayoutItems
@@ -110,13 +118,14 @@ local function ClassifyItem(classID, quality)
 end
 
 ---------------------------------------------------------------------------
--- Equipment Set Lookup (tooltip scanning)
+-- Item flags (set / bound / upgrade track)
 ---------------------------------------------------------------------------
--- Hidden tooltip used to scan for "Equipment Set:" text
-local scanTooltip = CreateFrame("GameTooltip", "JarsBagsScanTooltip", nil, "GameTooltipTemplate")
-scanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+-- old hidden GameTooltip scan, english only and ran on every refresh
+-- local scanTooltip = CreateFrame("GameTooltip", "JarsBagsScanTooltip", nil, "GameTooltipTemplate")
+-- scanTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
 
 -- Upgrade track patterns: "Veteran 3/8", "Champion 4/8", "Hero 2/6", "Myth 1/6"
+-- still english text, see handoff
 local TRACK_PATTERNS = {
     { pattern = "Veteran %d",  letter = "V", color = {0.12, 1.0, 0.0} },   -- green
     { pattern = "Champion %d", letter = "C", color = {0.0, 0.44, 0.87} },   -- blue
@@ -124,61 +133,33 @@ local TRACK_PATTERNS = {
     { pattern = "Myth %d",     letter = "M", color = {1.0, 0.5, 0.0} },     -- orange
 }
 
-local function ScanTooltipForFlags(bagID, slotID)
-    scanTooltip:ClearLines()
-    scanTooltip:SetBagItem(bagID, slotID)
-    local isSet, isBound = false, false
-    local trackLetter, trackColor = nil, nil
-    for i = 1, scanTooltip:NumLines() do
-        local left = _G["JarsBagsScanTooltipTextLeft" .. i]
-        if left then
-            local text = left:GetText()
-            if text then
-                if text:find("Equipment Sets:") then isSet = true end
-                if text == ITEM_SOULBOUND or text == ITEM_ACCOUNTBOUND
-                   or text == ITEM_BNETACCOUNTBOUND then
-                    isBound = true
-                end
-                if not trackLetter then
-                    for _, tp in ipairs(TRACK_PATTERNS) do
-                        if text:find(tp.pattern) then
-                            trackLetter = tp.letter
-                            trackColor = tp.color
-                            break
-                        end
-                    end
+-- track only depends on the link so cache it per hyperlink
+local function GetUpgradeTrack(bagID, slotID, hyperlink)
+    local cached = trackCache[hyperlink]
+    if cached ~= nil then return cached end
+
+    local data = C_TooltipInfo.GetBagItem(bagID, slotID)
+    if not data or not data.lines or #data.lines < 2 then return false end -- not loaded yet, try later
+    local result = false
+    for _, line in ipairs(data.lines) do
+        local text = line.leftText
+        if text then
+            for _, tp in ipairs(TRACK_PATTERNS) do
+                if text:find(tp.pattern) then
+                    result = { letter = tp.letter, color = tp.color }
+                    break
                 end
             end
         end
+        if result then break end
     end
-    return isSet, isBound, trackLetter, trackColor
+    trackCache[hyperlink] = result
+    return result
 end
 
 local function IsInEquipmentSet(bagID, slotID)
-    local isSet = ScanTooltipForFlags(bagID, slotID)
-    return isSet
-end
-
-local soulboundLookup = {}   -- ["bagID-slotID"] = true
-local trackLookup = {}       -- ["bagID-slotID"] = { letter = "V", color = {r,g,b} }
-
-local function RebuildTooltipLookups()
-    wipe(equipSetLookup)
-    wipe(soulboundLookup)
-    wipe(trackLookup)
-    for _, bagID in ipairs(BAG_IDS) do
-        local numSlots = C_Container.GetContainerNumSlots(bagID)
-        for slotID = 1, numSlots do
-            local info = C_Container.GetContainerItemInfo(bagID, slotID)
-            if info and info.itemID then
-                local isSet, isBound, tLetter, tColor = ScanTooltipForFlags(bagID, slotID)
-                local key = bagID .. "-" .. slotID
-                if isSet then equipSetLookup[key] = true end
-                if isBound then soulboundLookup[key] = true end
-                if tLetter then trackLookup[key] = { letter = tLetter, color = tColor } end
-            end
-        end
-    end
+    local inSet = C_Container.GetContainerItemEquipmentSetInfo(bagID, slotID)
+    return inSet
 end
 
 
@@ -202,8 +183,8 @@ end
 --   ContainerFrameItemButton_OnModifiedClick(self)    — split stack / chat link
 --
 -- If click actions break, check:
---   - btn:SetID(slotID) is called in LayoutItems ✓
---   - btn:SetParent(bagParentFrames[item.bagID]) is called in LayoutItems ✓
+--   - btn:SetID(slotID) is called once in CreateSlotButton ✓
+--   - btn is created with parent bagParentFrames[bagID] in CreateSlotButton ✓
 --   - bagParentFrames[bagID]:SetID(bagID) is set at init ✓
 --   - btn:SetScript("OnEvent", nil) and ("OnShow", nil) only kill
 --     auto-update, NOT click handlers (those are on the template XML) ✓
@@ -213,23 +194,19 @@ end
 ---------------------------------------------------------------------------
 
 ---------------------------------------------------------------------------
--- Item Button Pool
+-- Item Buttons - one per bag slot, made out of combat only
 -- Uses ContainerFrameItemButtonTemplate for secure click/use/drag.
 -- We suppress template visuals and draw our own.
 ---------------------------------------------------------------------------
-local itemButtonIndex = 0
-local function GetItemButton()
+local function CreateSlotButton(bagID, slotID)
     local btn
-    if #itemButtons > 0 then
-        btn = table.remove(itemButtons)
-        -- parent is set per-slot in LayoutItems via btn:SetParent(bagParentFrames[bagID])
-    else
-        itemButtonIndex = itemButtonIndex + 1
+    do
         -- ContainerFrameItemButtonTemplate handles all click/use behavior securely.
-        -- We use UIParent as initial parent; buttons are reparented to bagParentFrames in LayoutItems
-        -- so GetParent():GetID() returns the correct bag ID without any addon closures on the button.
-        btn = CreateFrame("ItemButton", "JarsBagsItemBtn" .. itemButtonIndex, UIParent,
+        -- parent + ID are set once here so GetParent():GetID() is always the right bag
+        btn = CreateFrame("ItemButton", "JarsBagsItemBtn" .. bagID .. "_" .. slotID, bagParentFrames[bagID],
             "ContainerFrameItemButtonTemplate")
+        btn:SetID(slotID)
+        btn:Hide()
         btn:SetSize(SLOT_SIZE, SLOT_SIZE)
         -- Kill template auto-update scripts - we drive all updates ourselves
         btn:SetScript("OnEvent", nil)
@@ -407,11 +384,31 @@ local function GetItemButton()
         fadeIn:SetOrder(2)
         fadeIn:SetSmoothing("IN_OUT")
 
+        -- cooldown swirl sits on the icon
+        if btn.Cooldown then
+            btn.Cooldown:ClearAllPoints()
+            btn.Cooldown:SetAllPoints(btn.icon)
+        end
+
+        -- clear the New flag when hovered
+        btn:HookScript("OnEnter", function(self)
+            local key = bagID .. "-" .. self:GetID()
+            if newItemCache[key] then
+                C_NewItems.RemoveNewItem(bagID, self:GetID())
+                newItemCache[key] = nil
+                self.newItemGlow:Hide()
+                self.newItemGlowAG:Stop()
+            end
+        end)
     end
 
-    btn:Show()
-    table.insert(activeButtons, btn)
+    slotButtons[bagID] = slotButtons[bagID] or {}
+    slotButtons[bagID][slotID] = btn
     return btn
+end
+
+local function GetSlotButton(bagID, slotID)
+    return slotButtons[bagID] and slotButtons[bagID][slotID]
 end
 
 local function ReleaseAllButtons()
@@ -438,7 +435,7 @@ local function ReleaseAllButtons()
             btn.newItemGlow:Hide()
             btn.newItemGlowAG:Stop()
         end
-        table.insert(itemButtons, btn)
+        if btn.Cooldown then btn.Cooldown:Hide() end
     end
     wipe(activeButtons)
 end
@@ -481,9 +478,73 @@ local function ReleaseAllHeaders()
     wipe(activeHeaders)
 end
 
+-- make a button for every slot we have. never in combat
+local function EnsureButtons()
+    if InCombatLockdown() then
+        needsCombatRefresh = true -- try again after combat
+        return false
+    end
+    for _, bagID in ipairs(BAG_IDS) do
+        for slotID = 1, C_Container.GetContainerNumSlots(bagID) do
+            if not GetSlotButton(bagID, slotID) then
+                CreateSlotButton(bagID, slotID)
+            end
+        end
+    end
+    return true
+end
+
 ---------------------------------------------------------------------------
 -- Bag Scanning & Categorization
 ---------------------------------------------------------------------------
+local QUALITY_BY_HEX = {
+    ["9d9d9d"] = 0, -- Poor
+    ["ffffff"] = 1, -- Common
+    ["1eff00"] = 2, -- Uncommon
+    ["0070dd"] = 3, -- Rare
+    ["a335ee"] = 4, -- Epic
+    ["ff8000"] = 5, -- Legendary
+    ["e6cc80"] = 6, -- Artifact
+    ["00ccff"] = 7, -- Heirloom
+}
+
+-- rescan one bag into slotData
+local function ScanBag(bagID)
+    local data = {}
+    for slotID = 1, C_Container.GetContainerNumSlots(bagID) do
+        local info = C_Container.GetContainerItemInfo(bagID, slotID)
+        if info and info.itemID then
+            -- instant info works even when the item isnt cached yet
+            local _, _, _, _, _, classID = C_Item.GetItemInfoInstant(info.itemID)
+
+            -- info.quality is the instance quality (scaled/upgraded), link color as fallback
+            local quality = info.quality
+            if not quality and info.hyperlink then
+                local hexColor = info.hyperlink:match("|cff(%x%x%x%x%x%x)")
+                if hexColor then quality = QUALITY_BY_HEX[hexColor:lower()] end
+            end
+            quality = quality or C_Item.GetItemQualityByID(info.itemID) or 1
+
+            data[slotID] = {
+                bagID = bagID,
+                slotID = slotID,
+                itemID = info.itemID,
+                name = info.itemName or "",
+                icon = info.iconFileID,
+                count = info.stackCount,
+                quality = quality,
+                classID = classID or 15, -- default to Miscellaneous
+                isLocked = info.isLocked,
+                isBound = info.isBound,
+                hyperlink = info.hyperlink,
+            }
+        else
+            data[slotID] = false
+        end
+    end
+    slotData[bagID] = data
+end
+
 local function ScanBags()
     local categories = {}
     for _, cat in ipairs(CATEGORY_ORDER) do
@@ -491,52 +552,13 @@ local function ScanBags()
     end
 
     for _, bagID in ipairs(BAG_IDS) do
-        local numSlots = C_Container.GetContainerNumSlots(bagID)
-        for slotID = 1, numSlots do
-            local info = C_Container.GetContainerItemInfo(bagID, slotID)
-            if info and info.itemID then
-                local itemName, _, baseQuality, _, _, _, _, _, _, _, _, classID = C_Item.GetItemInfo(info.itemID)
-                local name = itemName or ""
-                local cID = classID or 15 -- default to Miscellaneous
-
-                -- Determine quality: prefer the actual item link color (accounts for scaling)
-                -- info.quality is the instance quality from the bag (scaled/upgraded)
-                -- baseQuality from GetItemInfo is just the base item template quality
-                -- Also parse hyperlink color as ultimate fallback
-                local quality = info.quality
-                if not quality and info.hyperlink then
-                    local hexColor = info.hyperlink:match("|cff(%x%x%x%x%x%x)")
-                    if hexColor then
-                        -- Match hex color to quality
-                        local colorMap = {
-                            ["9d9d9d"] = 0, -- Poor
-                            ["ffffff"] = 1, -- Common
-                            ["1eff00"] = 2, -- Uncommon
-                            ["0070dd"] = 3, -- Rare
-                            ["a335ee"] = 4, -- Epic
-                            ["ff8000"] = 5, -- Legendary
-                            ["e6cc80"] = 6, -- Artifact
-                            ["00ccff"] = 7, -- Heirloom
-                        }
-                        quality = colorMap[hexColor:lower()] or baseQuality or 1
-                    end
-                end
-                quality = quality or baseQuality or 1
-
-                local category = ClassifyItem(cID, quality)
-
-                table.insert(categories[category], {
-                    bagID = bagID,
-                    slotID = slotID,
-                    itemID = info.itemID,
-                    name = name,
-                    icon = info.iconFileID,
-                    count = info.stackCount,
-                    quality = quality,
-                    classID = cID,
-                    isLocked = info.isLocked,
-                    hyperlink = info.hyperlink,
-                })
+        if dirtyBags[bagID] or not slotData[bagID] then
+            ScanBag(bagID)
+            dirtyBags[bagID] = nil
+        end
+        for _, item in ipairs(slotData[bagID]) do
+            if item then
+                table.insert(categories[ClassifyItem(item.classID, item.quality)], item)
             end
         end
     end
@@ -573,7 +595,6 @@ local BG_MODE_LABELS = BestGearCore.MODE_LABELS
 ---------------------------------------------------------------------------
 -- Layout Engine
 ---------------------------------------------------------------------------
-local newItemCache = {}   -- ["bagID-slotID"] = true, rebuilt each RefreshBags
 
 local function LayoutItems(content, categories)
     ReleaseAllButtons()
@@ -592,21 +613,26 @@ local function LayoutItems(content, categories)
     local filterText = mainFrame and mainFrame.searchFilter or ""
     if filterText == "" then filterText = nil end
 
-    if showSets or showSoulbound or showTrack then
-        RebuildTooltipLookups()
-    end
-    if showBestGear then
+    -- if showSets or showSoulbound or showTrack then
+    --     RebuildTooltipLookups()
+    -- end
+    if showBestGear and bestGearDirty then
         BG_BuildBestGearLookup(JarsBagsDB.bestGearMode or "ILVL")
+        bestGearDirty = false
     end
 
     for _, catName in ipairs(CATEGORY_ORDER) do
         local items = categories[catName]
         if items and #items > 0 then
-            -- Apply filters
-            if filterNew or filterText then
+            -- Apply filters (and skip slots that dont have a button yet - combat)
+            do
                 local filtered = {}
                 for _, item in ipairs(items) do
                     local pass = true
+                    if not GetSlotButton(item.bagID, item.slotID) then
+                        pass = false
+                        needsCombatRefresh = true
+                    end
                     if filterNew then
                         local nk = item.bagID .. "-" .. item.slotID
                         if not newItemCache[nk] then
@@ -636,9 +662,9 @@ local function LayoutItems(content, categories)
                 local col = (i - 1) % COLUMNS
                 local row = math.floor((i - 1) / COLUMNS)
 
-                local btn = GetItemButton()
-                btn:SetParent(bagParentFrames[item.bagID])
-                btn:SetID(item.slotID)
+                local btn = GetSlotButton(item.bagID, item.slotID)
+                btn:Show()
+                table.insert(activeButtons, btn)
                 btn.hasItem = true
                 btn:SetPoint("TOPLEFT", content, "TOPLEFT",
                     col * (SLOT_SIZE + SLOT_SPACING),
@@ -656,6 +682,7 @@ local function LayoutItems(content, categories)
                 SetItemButtonTexture(btn, item.icon)
                 SetItemButtonDesaturated(btn, item.isLocked)
                 SetItemButtonCount(btn, item.count or 0)
+                CooldownFrame_Set(btn.Cooldown, C_Container.GetContainerItemCooldown(item.bagID, item.slotID))
 
                 -- Quality border (suppressed when BestGear highlight is active)
                 local qColor = QUALITY_COLORS[item.quality]
@@ -696,15 +723,16 @@ local function LayoutItems(content, categories)
 
                 -- Equipment set highlight (suppressed when BestGear highlight is active)
                 local key = item.bagID .. "-" .. item.slotID
-                if showSets and not showBestGear and equipSetLookup[key] then
+                if showSets and not showBestGear and IsInEquipmentSet(item.bagID, item.slotID) then
                     for _, t in ipairs(btn.setBrackets) do t:Show() end
                 else
                     for _, t in ipairs(btn.setBrackets) do t:Hide() end
                 end
 
                 -- Upgrade track letter
-                if showTrack and trackLookup[key] then
-                    local t = trackLookup[key]
+                local t = showTrack and item.hyperlink and (item.classID == 2 or item.classID == 4)
+                    and GetUpgradeTrack(item.bagID, item.slotID, item.hyperlink)
+                if t then
                     btn.trackText:SetText(t.letter)
                     btn.trackText:SetTextColor(t.color[1], t.color[2], t.color[3], 1)
                 else
@@ -712,7 +740,7 @@ local function LayoutItems(content, categories)
                 end
 
                 -- Soulbound highlight (suppressed when BestGear highlight is active)
-                if showSoulbound and not showBestGear and soulboundLookup[key] then
+                if showSoulbound and not showBestGear and item.isBound then
                     for _, t in ipairs(btn.soulboundBorders) do t:Show() end
                 else
                     for _, t in ipairs(btn.soulboundBorders) do t:Hide() end
@@ -938,6 +966,7 @@ local function CreateBagFrame()
     bgCheck:SetScript("OnClick", function(self)
         JarsBagsDB.highlightBestGear = not JarsBagsDB.highlightBestGear
         self.check:SetShown(JarsBagsDB.highlightBestGear)
+        bestGearDirty = true
         if frame:IsShown() then frame:RefreshBags() end
     end)
     frame.bgCheck = bgCheck
@@ -960,6 +989,7 @@ local function CreateBagFrame()
         local nxt = BG_MODES[(idx % #BG_MODES)+1]
         JarsBagsDB.bestGearMode = nxt.key
         self.label:SetText(nxt.label)
+        bestGearDirty = true
         if frame:IsShown() and JarsBagsDB.highlightBestGear then frame:RefreshBags() end
     end)
     bgModeBtn:SetScript("OnEnter", function(self)
@@ -1001,11 +1031,15 @@ local function CreateBagFrame()
     searchBox:SetMaxLetters(40)
     searchBox:EnableMouse(true)
 
+    -- debounce typing so we dont relayout every keystroke
+    local searchTimer
     searchBox:SetScript("OnTextChanged", function(self)
         frame.searchFilter = self:GetText():lower()
-        if frame:IsShown() then
-            frame:RefreshBags()
-        end
+        if searchTimer then searchTimer:Cancel() end
+        searchTimer = C_Timer.NewTimer(0.15, function()
+            searchTimer = nil
+            if frame:IsShown() then frame:RefreshBags() end
+        end)
     end)
     searchBox:SetScript("OnEscapePressed", function(self)
         self:SetText("")
@@ -1061,6 +1095,7 @@ local function CreateBagFrame()
 
     -- Refresh function
     function frame:RefreshBags()
+        EnsureButtons()
         -- Snapshot new-item flags every refresh (cache is used by filter & glow)
         wipe(newItemCache)
         if C_NewItems then
@@ -1083,11 +1118,9 @@ local function CreateBagFrame()
         -- Update free slots
         local totalSlots, usedSlots = 0, 0
         for _, bagID in ipairs(BAG_IDS) do
-            local numSlots = C_Container.GetContainerNumSlots(bagID)
-            totalSlots = totalSlots + numSlots
-            for slotID = 1, numSlots do
-                local info = C_Container.GetContainerItemInfo(bagID, slotID)
-                if info then usedSlots = usedSlots + 1 end
+            for _, item in ipairs(slotData[bagID] or {}) do
+                totalSlots = totalSlots + 1
+                if item then usedSlots = usedSlots + 1 end
             end
         end
         self.slotText:SetText((totalSlots - usedSlots) .. " free / " .. totalSlots .. " slots")
@@ -1120,6 +1153,26 @@ end
 -- Default Bag Suppression & Hooks
 ---------------------------------------------------------------------------
 local bagsHooked = false
+local openedByNpc = false     -- frame was opened by a vendor/bank/mail OpenAllBags
+local lastBagAction = 0       -- GetTime() of the last toggle, stops double toggles in one frame
+
+local NPC_BAG_TYPES = {
+    [Enum.PlayerInteractionType.Merchant]    = true,
+    [Enum.PlayerInteractionType.Banker]      = true,
+    [Enum.PlayerInteractionType.GuildBanker] = true,
+    [Enum.PlayerInteractionType.MailInfo]    = true,
+}
+
+local function IsNpcKeepingBagsOpen()
+    for t in pairs(NPC_BAG_TYPES) do
+        if C_PlayerInteractionManager.IsInteractingWithNpcOfType(t) then return true end
+    end
+    return false
+end
+
+-- blizz bags get parked here, bartender style
+local hiddenBagParent = CreateFrame("Frame")
+hiddenBagParent:Hide()
 
 local function HookDefaultBags()
     if bagsHooked then return end
@@ -1131,45 +1184,55 @@ local function HookDefaultBags()
     -- ContainerFrameCombinedBags (retail combined view)
     if ContainerFrameCombinedBags then
         ContainerFrameCombinedBags:UnregisterAllEvents()
-        ContainerFrameCombinedBags:SetScript("OnShow", function(self) self:Hide() end)
-        ContainerFrameCombinedBags:Hide()
+        -- ContainerFrameCombinedBags:SetScript("OnShow", function(self) self:Hide() end)
+        -- ContainerFrameCombinedBags:Hide()
+        ContainerFrameCombinedBags:SetParent(hiddenBagParent)
     end
     -- Legacy individual container frames (1-13)
     for i = 1, 13 do
         local cf = _G["ContainerFrame" .. i]
         if cf then
             cf:UnregisterAllEvents()
-            cf:SetScript("OnShow", function(self) self:Hide() end)
-            cf:Hide()
+            cf:SetParent(hiddenBagParent)
         end
     end
 
-    -- Single hook on ToggleAllBags handles the bag button / keybind.
-    -- We intentionally do NOT hook OpenAllBags/CloseAllBags separately,
-    -- because ToggleAllBags calls them internally and double-hooking
-    -- causes the show/hide to fight itself.
-    hooksecurefunc("ToggleAllBags", function()
+    -- Bag button / keybinds. ToggleBackpack can call ToggleBag or CloseAllBags
+    -- inside it so only the first one per frame counts
+    local function ToggleOurBags()
+        local now = GetTime()
+        if now == lastBagAction then return end
+        lastBagAction = now
         if frame:IsShown() then
             frame:Hide()
         else
+            openedByNpc = false
             frame:Show()
             frame:RefreshBags()
         end
-    end)
+    end
+    hooksecurefunc("ToggleAllBags", ToggleOurBags)
+    hooksecurefunc("ToggleBackpack", ToggleOurBags)
+    hooksecurefunc("ToggleBag", ToggleOurBags)
 
     -- OpenAllBags is called by vendors, mail, etc. — just make sure our frame opens.
     hooksecurefunc("OpenAllBags", function()
         if not frame:IsShown() then
+            openedByNpc = IsNpcKeepingBagsOpen()
             frame:Show()
             frame:RefreshBags()
         end
     end)
 
     hooksecurefunc("CloseAllBags", function()
-        frame:Hide()
+        -- Don't close if an NPC interaction is keeping bags open (vendor, mail, bank, etc.)
+        -- Selling/buying items triggers CloseAllBags+OpenAllBags internally
+        if IsNpcKeepingBagsOpen() then return end
+        if frame:IsShown() then
+            lastBagAction = GetTime()
+            frame:Hide()
+        end
     end)
-
-
 end
 
 ---------------------------------------------------------------------------
@@ -1179,9 +1242,15 @@ local CreateBestGearUI  -- defined below; forward-declared so PLAYER_LOGIN can c
 
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("PLAYER_LOGIN")
+eventFrame:RegisterEvent("BAG_UPDATE")
 eventFrame:RegisterEvent("BAG_UPDATE_DELAYED")
+eventFrame:RegisterEvent("BAG_CONTAINER_UPDATE")
+eventFrame:RegisterEvent("BAG_UPDATE_COOLDOWN")
 eventFrame:RegisterEvent("EQUIPMENT_SETS_CHANGED")
+eventFrame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 eventFrame:RegisterEvent("ITEM_LOCK_CHANGED")
+eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+eventFrame:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "PLAYER_LOGIN" then
@@ -1193,6 +1262,10 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         end
 
         CreateBagFrame()
+        EnsureButtons()
+        -- headers too while we're at it
+        for _ = 1, #CATEGORY_ORDER do GetCategoryHeader(mainFrame.content) end
+        ReleaseAllHeaders()
         HookDefaultBags()
         CreateBestGearUI()
 
@@ -1203,9 +1276,24 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
         print("|cff00ccffJar's Bags|r loaded. |cff00ff00/jb|r to toggle, |cff00ff00/jb options|r for settings.")
 
+    elseif event == "BAG_UPDATE" then
+        local bagID = ...
+        dirtyBags[bagID] = true
+        bestGearDirty = true
+
+    elseif event == "BAG_CONTAINER_UPDATE" then
+        for _, bagID in ipairs(BAG_IDS) do dirtyBags[bagID] = true end
+        bestGearDirty = true
+
     elseif event == "BAG_UPDATE_DELAYED" then
+        EnsureButtons()
         if mainFrame and mainFrame:IsShown() then
             mainFrame:ScheduleRefresh()
+        end
+
+    elseif event == "BAG_UPDATE_COOLDOWN" then
+        for _, btn in ipairs(activeButtons) do
+            CooldownFrame_Set(btn.Cooldown, C_Container.GetContainerItemCooldown(btn:GetParent():GetID(), btn:GetID()))
         end
 
     elseif event == "EQUIPMENT_SETS_CHANGED" then
@@ -1213,9 +1301,39 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             mainFrame:ScheduleRefresh()
         end
 
-    elseif event == "ITEM_LOCK_CHANGED" then
-        if mainFrame and mainFrame:IsShown() then
+    elseif event == "PLAYER_EQUIPMENT_CHANGED" then
+        bestGearDirty = true
+        if mainFrame and mainFrame:IsShown() and JarsBagsDB.highlightBestGear then
             mainFrame:ScheduleRefresh()
+        end
+
+    elseif event == "ITEM_LOCK_CHANGED" then
+        -- just the one button, no full refresh
+        local bagID, slotID = ...
+        if not slotID then return end -- equipment slot
+        local info = C_Container.GetContainerItemInfo(bagID, slotID)
+        local locked = info and info.isLocked or false
+        local entry = slotData[bagID] and slotData[bagID][slotID]
+        if entry then entry.isLocked = locked end
+        local btn = GetSlotButton(bagID, slotID)
+        if btn and btn:IsShown() then
+            SetItemButtonDesaturated(btn, locked)
+        end
+
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        if needsCombatRefresh then
+            needsCombatRefresh = false
+            EnsureButtons()
+            if mainFrame and mainFrame:IsShown() then
+                mainFrame:ScheduleRefresh()
+            end
+        end
+
+    elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
+        local interactionType = ...
+        if openedByNpc and NPC_BAG_TYPES[interactionType] and mainFrame then
+            openedByNpc = false
+            mainFrame:Hide()
         end
     end
 end)
@@ -1336,6 +1454,7 @@ local function CreateOptionsPanel()
         if mainFrame then mainFrame:SetScale(value) end
     end
 
+    local slider -- made below, the +/- buttons need it
     local minusBtn = CreateFrame("Button", nil, f, "BackdropTemplate")
     minusBtn:SetSize(20, 20)
     minusBtn:SetPoint("TOPLEFT", 16, yPos)
@@ -1372,7 +1491,7 @@ local function CreateOptionsPanel()
         slider:SetValue(JarsBagsDB.bagScale)
     end)
 
-    local slider = CreateFrame("Slider", nil, f, "BackdropTemplate")
+    slider = CreateFrame("Slider", nil, f, "BackdropTemplate")
     slider:SetSize(190, 20)
     slider:SetPoint("LEFT", minusBtn, "RIGHT", 4, 0)
     slider:SetPoint("RIGHT", plusBtn, "LEFT", -4, 0)
@@ -1455,6 +1574,11 @@ end
 
 local function BG_ProcessEquipQueue()
     if #bgEquipQueue == 0 then return end
+    if InCombatLockdown() then
+        print("|cFFFF4444BestGear:|r Combat started, stopped equipping.")
+        wipe(bgEquipQueue)
+        return
+    end
     local item = table.remove(bgEquipQueue, 1)
 
     local bag, bagSlot = item.bag, item.slot
@@ -1499,6 +1623,7 @@ local function BG_CycleMode()
     for i, m in ipairs(modes) do if m.key == cur then idx = i; break end end
     local nxt = modes[(idx % #modes) + 1]
     JarsBagsDB.bestGearMode = nxt.key
+    bestGearDirty = true
     if bgModeButton then bgModeButton:SetText(nxt.label) end
     -- If bag window is open and highlight is on, refresh to show new mode
     if mainFrame and mainFrame:IsShown() and JarsBagsDB.highlightBestGear then
@@ -1585,6 +1710,7 @@ SlashCmdList["BESTGEAR"] = function(msg)
         for _, m in ipairs(BestGearCore.MODES) do
             if m.label:lower():find(msg, 1, true) then
                 JarsBagsDB.bestGearMode = m.key
+                bestGearDirty = true
                 if bgModeButton then bgModeButton:SetText(m.label) end
                 print("|cFFFFD100BestGear mode set to:|r " .. m.label)
                 return
